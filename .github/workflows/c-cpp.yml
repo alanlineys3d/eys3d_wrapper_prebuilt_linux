@@ -32,7 +32,7 @@ jobs:
         run: |
           cd ../
           mkdir -p artifacts
-          tar czhvf artifacts/${{ steps.get_tarball_name.outputs.TARBALL_NAME }}.tar.gz --exclude-vcs ./${{ github.event.repository.name }}
+          tar czvf artifacts/${{ steps.get_tarball_name.outputs.TARBALL_NAME }}.tar.gz --exclude-vcs ./${{ github.event.repository.name }}
           
       - name: Create draft release
         id: create_release
