@@ -33,7 +33,19 @@ jobs:
           mkdir -p artifacts
           tar czhvf \
             artifacts/${{ steps.get_tarball_name.outputs.TARBALL_NAME }}.tar.gz \
-            --directory=../
+            --directory=../ \
+            CMakeLists.txt \
+            LICENSE \
+            build.sh \
+            build_NVIDIA.sh \
+            eYs3D \
+            include \
+            lib \
+            readme.txt \
+            run_callback.sh \
+            run_frameset_pipeline.sh \
+            run_pipeline.sh \
+            src
       - name: Create draft release
         id: create_release
         uses: actions/create-release@v1
