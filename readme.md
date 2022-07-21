@@ -1,13 +1,18 @@
-### Overview **eYs3D® wrapper SDK** is a cross-platform library for eYs3D® eCapture™ depth cameras
+## Overview **eYs3D® wrapper SDK** is a cross-platform library for eYs3D® eCapture™ depth cameras
 
 
-## 1. Build general wrapper linux (Ubuntu x86_64)
+### 1. Build general wrapper linux (Ubuntu 16.04 or above)
 
-Please run below command:
+x86_64
 ```
 sh build.sh
 ```
-## 2. Run sample codes
+
+aarch64
+```
+sh build_NVIDIA.sh
+```
+### 2. Run sample codes
 
 Demo callback APIs. When users want to register a function callback for each stream or even an empty function.
 ```
