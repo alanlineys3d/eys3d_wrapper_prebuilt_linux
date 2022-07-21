@@ -24,16 +24,16 @@ jobs:
       - name: Get archived folder name for custom tarball
         id: get_archived_folder_name
         run: echo ::set-output name=ARCHIVED_FOLDER::${{ github.repository_owner }}-vulner-$(git rev-parse --short HEAD)
-
+      - name: Shell PWD
+        run: |
+          pwd
+          ls -al
       - name: Create custom tarball artifact
         run: |
           mkdir -p artifacts
           tar czhvf \
             artifacts/${{ steps.get_tarball_name.outputs.TARBALL_NAME }}.tar.gz \
-            --exclude="*metarepo-cpe-tag*" \
-            --directory=../ \
-            vulner/crates/ vulner/Cargo.lock vulner/Cargo.toml vulner/Makefile vulner/scripts/ vulner/README.md vulner/LICENSE \
-            --transform s/vulner/${{ steps.get_archived_folder_name.outputs.ARCHIVED_FOLDER }}/
+            --directory=../
       - name: Create draft release
         id: create_release
         uses: actions/create-release@v1
