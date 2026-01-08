@@ -8,6 +8,8 @@
 
 #include <stdint.h>                                   // for uint32_t, uint8_t
 #include <memory>                                     // for unique_ptr
+#include <array>                                      // for std::array
+#include <atomic>                                     // for std::atomic
 
 #include "video/Producer.h"
 #include "base/synchronization/MessageChannel.h"
@@ -51,7 +53,13 @@ public:
 // fetching and encoding and also using multiple buffers we can feed the encoder
 // a relatively constant rate of frames.
 class FrameProducer : public Producer    {
+    // Friend declaration for ILM frame router to access mFrameProducerState
+    friend class ILMFrameRouter;
+
 public:
+    // Frame queue capacity - defined early for use in method signatures
+    static constexpr int kMaxFrames = 2;
+
     virtual ~FrameProducer() {}
 
     intptr_t main() final;
@@ -77,6 +85,36 @@ public:
     bool doColorSnapShot = false;
     bool doDepthSnapShot = false;
 
+    // ILM Shared Pool Support - Accessor for ILMFrameRouter to route frames to mDataQueue
+    base::MessageChannel<Frame, kMaxFrames>& getDataQueue() {
+        return mDataQueue;
+    }
+
+    // ILM Shared Pool Support - Accessor for ILMFrameRouter to route frames to mStageQueue
+    // This routes frames through the full processing pipeline (filtering + RGB conversion)
+    base::MessageChannel<Frame, kMaxFrames>& getStageQueue() {
+        return mStageQueue;
+    }
+
+    /**
+     * Inject shared free pool pointer for ILM mode.
+     * Must be called BEFORE start() if using ILM mode.
+     *
+     * @param sharedPool Pointer to shared pool managed by ILMFrameRouter
+     */
+    void setSharedFreeQueue(base::MessageChannel<Frame, 4>* sharedPool) {
+        mSharedFreeQueue = sharedPool;
+    }
+
+    /**
+     * Check if using ILM shared pool.
+     *
+     * @return true if shared pool injected, false for normal mode
+     */
+    bool isUsingILMSharedPool() const {
+        return mSharedFreeQueue != nullptr;
+    }
+
 protected:
     FrameProducer(libeYs3D::devices::CameraDevice *cameraDevice,
                   int32_t fWidth, int32_t fHeight, int32_t fFormat, uint8_t fps);
@@ -84,6 +122,23 @@ protected:
     virtual int getRawFormatBytesPerPixel(uint32_t format) = 0;
     virtual int readFrame(Frame *frame) = 0;
     virtual int produceRGBFrame(Frame *frame) = 0;
+    virtual int performPostProcessFilter(Frame *frame) = 0;
+
+    /**
+     * This value is set after Camera::initStream by decimation factor.
+     * It will keep the same as depth width if PostProcessOption !isEnable, and will be resized width if decimation
+     * factor is set >= 2.
+     * @return Decimation filter resized width if PostProcessOption::isEnable().
+     */
+    virtual int getFilteredWidth() = 0;
+    /**
+     * This value is set after Camera::initStream by decimation factor.
+     * It will keep the same as depth height if PostProcessOption !isEnable, and will be resized width if decimation
+     * factor is set >= 2.
+     * @return Decimation filter resized height if PostProcessOption::isEnable().
+     */
+    virtual int getFilteredHeight() = 0;
+
     virtual int performFiltering(Frame *frame) = 0;
     virtual int performInterleave(Frame *frame) = 0;
     virtual int performAccuracyComputation(Frame *frame) = 0;
@@ -115,9 +170,13 @@ protected:
     base::MessageChannel<int, 1> mSnapshotFinishedSignal;
     
     libeYs3D::sensors::SensorDataProducer::Callback mIMUDataCallback;
-    
+
     uint32_t mFrameProducerState;
     bool mIsStopped = false;
+
+    // ILM mode: Pointer to shared free pool (owned by ILMFrameRouter)
+    // Normal mode: nullptr (use mFreeQueue instead)
+    base::MessageChannel<Frame, 4>* mSharedFreeQueue = nullptr;
 
 private:
     void initialize();
@@ -128,9 +187,12 @@ private:
     void rgbFramesWorker();
     // Helper to perfrom filetering
     void frameFilteringWorker();
-  
+
     // Heper to perfrom snapshot
     virtual void performSnapshotWork(Frame *frame) = 0;
+
+    // Helper to send frame to correct free queue (shared pool or normal)
+    bool sendToFreeQueue(Frame&& frame);
 
     uint32_t mTimeDeltaMs;
     uint8_t  mFps;
@@ -146,7 +208,6 @@ private:
     //   1) wait for video frame in mDataQueue
     //   2) process video frame
     //   3) Push frame back to mFreeQueue
-    static constexpr int kMaxFrames = 16;
     base::MessageChannel<Frame, kMaxFrames> mDataQueue;
     base::MessageChannel<Frame, kMaxFrames> mStageQueue;
     base::MessageChannel<Frame, kMaxFrames> mStage2Queue;
@@ -181,6 +242,19 @@ private:
     uint64_t mLastTotalRGBTranscodingTimeUs = 0llu;
     uint64_t mTotalFilteringTimeUs = 0llu;
     uint64_t mLastTotalFilteringTimeUs = 0llu;
+    
+    // Optimized callback frame pool for high-performance frame processing
+    // Pool size: 2 frames (sufficient for concurrent APP+PC callbacks in synchronous execution)
+    static constexpr int kCallbackFramePoolSize = 2;
+    std::array<Frame, kCallbackFramePoolSize> mCallbackFramePool;
+    std::atomic<int> mCallbackFrameIndex{0};
+    
+    // Remove complex tracking - not needed for synchronous execution
+    // std::array<std::atomic<bool>, kCallbackFramePoolSize> mFrameInUse{};
+    
+    void initializeCallbackFramePool();
+    Frame& getCallbackFrame();
+    // Remove: void releaseCallbackFrame(Frame& frame);  // Not needed for synchronous execution
     
 public:
     friend class libeYs3D::devices::CameraDevice;

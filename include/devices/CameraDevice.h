@@ -7,13 +7,14 @@
 #pragma once
 
 #include "EYS3DSystem.h"
-#include "devices/MemoryAllocator.h"
 #include "devices/IMUDevice.h"
 #include "devices/controller/RegisterReadWriteController.h"
 #include "devices/model/DepthFilterOptions.h"
+#include "devices/model/PostProcessOptions.h"
 #include "devices/model/DepthAccuracyOptions.h"
 #include "devices/model/CameraDeviceProperties.h"
 #include "devices/model/IRProperty.h"
+#include "devices/ActionCategory.h"
 #include "DMPreview_utility/ModeConfigOptions.h"
 
 #include "video/video.h"
@@ -23,6 +24,8 @@
 #include "sensors/SensorDataProducer.h"
 #include "Constants.h"
 #include "utils.h"
+#include <mutex>
+#include <string>
 #ifdef WIN32
 #  include "eSPDI_Common.h"
 #  include "magic.h"
@@ -66,6 +69,8 @@
 
 #define DEFAULT_DEPTH_ROI_PIXELS 20
 
+#define APC_USER_SETTING_OFFSET 5
+
 namespace libeYs3D    {
 
 namespace devices    {
@@ -80,7 +85,9 @@ namespace video    { // forward declaration for friendship assignment
     class ColorFrameProducer;
     class DepthFrameProducer;
     class PCFrameProducer;
-     
+    class PostProcessHandle;
+    APCImageType::Value depth_raw_type_to_depth_image_type(uint32_t depth_raw_type,
+                                                           const libeYs3D::devices::CameraDevice* cameraDevice);
     int color_image_produce_bgr_frame(const libeYs3D::devices::CameraDevice *cameraDevice,
                                       libeYs3D::video::Frame *frame);
     int depth_image_produce_rgb_frame(const libeYs3D::devices::CameraDevice *cameraDevice,
@@ -98,27 +105,81 @@ namespace devices    {
 struct CameraDeviceInfo    {
     DEVINFORMATION devInfo;
 
-#ifdef WIN32
+    // RAII-managed storage for device name string.
+    // devInfo.strDevName (char*) points to this storage after construction.
+    // This ensures the string lives as long as CameraDeviceInfo.
+    std::string deviceNameStorage;
+
+    // Initialize all platforms consistently
     char firmwareVersion[PATH_MAX] = "Unsupported";
     char serialNumber[PATH_MAX] = "Unsupported";
     char busInfo[PATH_MAX] = "Unsupported";
     char modelName[PATH_MAX] = "Unsupported";
-#else
-    char firmwareVersion[PATH_MAX];
-    char serialNumber[PATH_MAX];
-    char busInfo[PATH_MAX];
-    char modelName[PATH_MAX];
-#endif
     USB_PORT_TYPE usbPortType;
 
     CameraDevice *cameraDevice;
 
-    CameraDeviceInfo(DEVINFORMATION *info)    {
+    CameraDeviceInfo(DEVINFORMATION *info) {
         this->devInfo = *info;
+        // Deep copy strDevName into our own storage
+        if (info->strDevName) {
+            deviceNameStorage = std::string(info->strDevName);
+            this->devInfo.strDevName = const_cast<char*>(deviceNameStorage.c_str());
+        } else {
+            this->devInfo.strDevName = nullptr;
+        }
         usbPortType = USB_PORT_TYPE_2_0;
     }
 
-    CameraDeviceInfo()    { usbPortType = USB_PORT_TYPE_2_0; }
+    CameraDeviceInfo() {
+        devInfo.strDevName = nullptr;
+        usbPortType = USB_PORT_TYPE_2_0;
+    }
+
+    // DELETE move operations - moving would invalidate strDevName pointer
+    CameraDeviceInfo(CameraDeviceInfo&&) = delete;
+    CameraDeviceInfo& operator=(CameraDeviceInfo&&) = delete;
+
+    // Custom copy constructor - must copy all fields including char arrays
+    CameraDeviceInfo(const CameraDeviceInfo& other)
+        : devInfo(other.devInfo),
+          deviceNameStorage(other.deviceNameStorage),
+          usbPortType(other.usbPortType),
+          cameraDevice(other.cameraDevice) {
+        // Copy char arrays using snprintf (guaranteed null-termination, bounds-safe)
+        snprintf(firmwareVersion, sizeof(firmwareVersion), "%s", other.firmwareVersion);
+        snprintf(serialNumber, sizeof(serialNumber), "%s", other.serialNumber);
+        snprintf(busInfo, sizeof(busInfo), "%s", other.busInfo);
+        snprintf(modelName, sizeof(modelName), "%s", other.modelName);
+        // Repoint strDevName to OUR copy of the string
+        if (!deviceNameStorage.empty()) {
+            devInfo.strDevName = const_cast<char*>(deviceNameStorage.c_str());
+        } else {
+            devInfo.strDevName = nullptr;
+        }
+    }
+
+    // Custom copy assignment - must copy all fields including char arrays
+    CameraDeviceInfo& operator=(const CameraDeviceInfo& other) {
+        if (this != &other) {
+            devInfo = other.devInfo;
+            deviceNameStorage = other.deviceNameStorage;
+            usbPortType = other.usbPortType;
+            cameraDevice = other.cameraDevice;
+            // Copy char arrays using snprintf (guaranteed null-termination, bounds-safe)
+            snprintf(firmwareVersion, sizeof(firmwareVersion), "%s", other.firmwareVersion);
+            snprintf(serialNumber, sizeof(serialNumber), "%s", other.serialNumber);
+            snprintf(busInfo, sizeof(busInfo), "%s", other.busInfo);
+            snprintf(modelName, sizeof(modelName), "%s", other.modelName);
+            // Repoint strDevName to OUR copy of the string
+            if (!deviceNameStorage.empty()) {
+                devInfo.strDevName = const_cast<char*>(deviceNameStorage.c_str());
+            } else {
+                devInfo.strDevName = nullptr;
+            }
+        }
+        return *this;
+    }
 
     int toString(char *buffer, int bufferLength) const;
     int toString(std::string &string) const;
@@ -147,16 +208,86 @@ public:
         int nRightFy = 0;
     };
 
-    /*
-     * colorFormat: libeYs3D::video::COLOR_RAW_DATA_TYPE
-     * depthFormat: libeYs3D::video::DEPTH_RAW_DATA_TYPE
-     * depthDataTransferCtrl: How depth frame data is transcoded to RGB
-     *     DEPTH_IMG_COLORFUL_TRANSFER, DEPTH_IMG_GRAY_TRANSFER, DEPTH_IMG_NON_TRANSFER (default)
-     * 
-     * return
-     *     0 (APC_OK): succeed
-     *     < 0           : align with with error codes defined in eSPDI_def.h
-     *     1:            : enabled, please realease the stream before it can be enabled again.
+    /**
+     * @brief Initialize camera stream with callback-based frame delivery (Pattern 1: Callback)
+     *
+     * Opens the camera device and starts frame production. Frames are delivered via callbacks
+     * in producer threads. Callbacks execute synchronously - processing time affects frame rate.
+     *
+     *
+     * @param colorFormat Color pixel format
+     *     - COLOR_RAW_DATA_YUY2: YUV422 packed (2 bytes/pixel, most common)
+     *     - COLOR_RAW_DATA_MJPG: Motion JPEG compressed
+     *
+     * @param colorWidth  Color frame width in pixels (0 to disable color stream)
+     * @param colorHeight Color frame height in pixels (0 to disable color stream)
+     *     - Must match a supported resolution
+     *
+     * @param actualFps Target frame rate (frames per second)
+     *     - Typical values: 30, 60 (device-dependent)
+     *
+     * @param depthFormat Depth data format (see video/video.h for full list)
+     *     - Standard modes:
+     *       - DEPTH_RAW_DATA_11_BITS: 2 bytes/pixel (11-bit), rectified
+     *       - DEPTH_RAW_DATA_14_BITS: 2 bytes/pixel (14-bit), rectified
+     *     - Interleave modes (ILM) - single endpoint for color+depth:
+     *       - DEPTH_RAW_DATA_ILM_11_BITS: 11-bit interleave
+     *       - DEPTH_RAW_DATA_ILM_14_BITS: 14-bit interleave
+     *     - eSP936 chip (80363) specific:
+     *       - DEPTH_RAW_DATA_ORANGE_11_BITS (0x18): 11-bit non-ILM
+     *       - DEPTH_RAW_DATA_ORANGE_14_BITS (0x19): 14-bit non-ILM
+     *       - DEPTH_RAW_DATA_ORANGE_11_BITS_ILM (0x1a): 11-bit interleave
+     *       - DEPTH_RAW_DATA_ORANGE_14_BITS_ILM (0x1b): 14-bit interleave
+     *
+     * @param depthWidth  Depth frame width in pixels (0 to disable depth stream)
+     * @param depthHeight Depth frame height in pixels (0 to disable depth stream)
+     *
+     * @param depthDataTransferCtrl Depth-to-RGB visualization mode for rgbVec output
+     *     - DEPTH_IMG_NON_TRANSFER: No RGB conversion, rgbVec will not fill in color palette view, saves computation.
+     *     - DEPTH_IMG_COLORFUL_TRANSFER: Convert to color heatmap visualization
+     *     - DEPTH_IMG_GRAY_TRANSFER: Convert to grayscale visualization
+     *
+     * @param ctrlMode Frame synchronization control (deprecated)
+     *     - IMAGE_SN_NONSYNC (0): Reserved
+     *     - IMAGE_SN_SYNC (1): Reserved
+     *
+     * @param rectifyLogIndex Calibration table index for depth-to-distance conversion
+     *     - Selects which rectification log data to use from device
+     *     - Typically 0 for default calibration, please read the ModeConfig.db for more information
+     *     G100+ device read the RECTIFY_FILE_INDEX column
+     *     G62 device we will setup well by the CameraDevice itself.
+     *
+     * @param colorImageCallback Called for each color frame (nullptr to disable)
+     *     - Signature: bool callback(const Frame* frame)
+     *     - Return value is currently unused (reserved for future use)
+     *     - Frame is valid only during callback execution
+     *     - WARNING: Long processing blocks producer thread
+     *
+     * @param depthImageCallback Called for each depth frame (nullptr to disable)
+     *     - Signature: bool callback(const Frame* frame)
+     *     - frame->dataVec: Raw depth data
+     *     - frame->zdDepthVec: ZD-table converted depth (mm)
+     *     - frame->rgbVec: Visualization (if depthDataTransferCtrl != DEPTH_IMG_NON_TRANSFER)
+     *
+     * @param pcFrameCallback Called for each point cloud frame (nullptr to disable)
+     *     - Signature: bool callback(const PCFrame* frame)
+     *     - Requires both color and depth streams active
+     *     - frame->xyzDataBuffer: XYZ coordinates
+     *     - frame->rgbDataBuffer: Per-point RGB colors
+     *
+     * @param imuDataCallback Called for each IMU sample (nullptr to disable, optional)
+     *     - Signature: bool callback(const SensorData* data)
+     *     - Only if device supports IMU (check isIMUDeviceSupported())
+     *
+     * @return
+     *     - 0 (APC_OK): Success
+     *     - 1: Stream already initialized (call closeStream() first)
+     *     - <0: Error code (see eSPDI_def.h for APC_* error codes)
+     *
+     * @note After initStream(), call enableStream() to start frame delivery.
+     * @note Call closeStream() before calling initStream() again.
+     *
+     * @see closeStream(), enableStream(), pauseStream()
      */
     virtual int initStream(libeYs3D::video::COLOR_RAW_DATA_TYPE colorFormat,
                            int32_t colorWidth, int32_t colorHeight, int32_t actualFps,
@@ -170,6 +301,19 @@ public:
                            libeYs3D::video::PCProducer::PCCallback pcFrameCallback,
                            libeYs3D::sensors::SensorDataProducer::AppCallback imuDataCallback = nullptr);
 
+    /**
+     * @brief Initialize camera stream with Pipeline-based frame retrieval (Pattern 2: Pipeline)
+     *
+     * Same parameters as callback version, but returns a Pipeline for pull-based access.
+     * Use pipeline->waitForColorFrame() / waitForDepthFrame() to retrieve frames.
+     *
+     * Pipeline uses LatestFrameBuffer internally - only the most recent frame is kept.
+     * If consumer is slower than producer, intermediate frames are silently discarded.
+     *
+     * @return shared_ptr<Pipeline> on success, nullptr on failure
+     *
+     * @see Pipeline class documentation for usage patterns
+     */
     std::shared_ptr<Pipeline>
     initStream(libeYs3D::video::COLOR_RAW_DATA_TYPE colorFormat,
                int32_t colorWidth, int32_t colorHeight, int32_t actualFps,
@@ -179,6 +323,18 @@ public:
                CONTROL_MODE ctrlMode,
                int rectifyLogIndex);
 
+    /**
+     * @brief Initialize camera stream with synchronized FrameSet retrieval (Pattern 3: FrameSetPipeline)
+     *
+     * Same parameters as callback version, but returns a FrameSetPipeline for
+     * synchronized color+depth+PC frame retrieval by serial number.
+     *
+     * Use pipeline->waitForFrameSet() to get temporally-aligned frames.
+     *
+     * @return shared_ptr<FrameSetPipeline> on success, nullptr on failure
+     *
+     * @see FrameSetPipeline class documentation for usage patterns
+     */
     std::shared_ptr<FrameSetPipeline>
     initStreamFS(libeYs3D::video::COLOR_RAW_DATA_TYPE colorFormat,
                  int32_t colorWidth, int32_t colorHeight, int32_t actualFps,
@@ -188,16 +344,18 @@ public:
                  CONTROL_MODE ctrlMode,
                  int rectifyLogIndex);
 
-    void enableStream();
+    virtual void enableStream();
+	void enableColorAndDepthStream_Python();
     void enableColorStream();
     void enableDepthStream();
     void enablePCStream();
     void enableIMUStream();
-    void pauseStream();
+    virtual void pauseStream();
     void pauseColorStream();
     void pauseDepthStream();
     void pausePCStream();
     void pauseIMUStream();
+	void pauseColorAndDepthStream_Python();
                             
     virtual int closeStream();
     
@@ -213,6 +371,31 @@ public:
     virtual bool isInterleaveModeSupported()    { return false; }
     virtual bool isInterleaveModeEnabled();
     virtual int enableInterleaveMode(bool enable);
+
+    /**
+     * Check if device is using ILM shared free pool.
+     *
+     * @return true if ILMFrameRouter is active, false otherwise
+     */
+    virtual bool isUsingILMSharedPool() const {
+        return false;  // Base class: not using ILM
+    }
+
+    /**
+     * @brief Get DEVSELINFO pointer for specific action category
+     *
+     * Polymorphic endpoint selection for multi-endpoint devices (e.g., 80363).
+     *
+     * Base class: Returns &mDevSelInfo for ALL categories (legacy single-endpoint behavior).
+     * Derived class (80363): Overrides with switch statement to route to correct endpoint.
+     *
+     * Usage: getDeviceInfoByCategory(ActionCategory::CALIBRATION)
+     *        getDeviceInfoByCategory(ActionCategory::IR_CONTROL)
+     *
+     * @param category Action category (CALIBRATION, IR_CONTROL, etc.)
+     * @return Pointer to appropriate DEVSELINFO structure
+     */
+    virtual DEVSELINFO* getDeviceInfoByCategory(ActionCategory category);
 
     // return a copy of current device DepthFilterOptions
     virtual DepthFilterOptions getDepthFilterOptions();
@@ -264,6 +447,26 @@ public:
     virtual int enableHWPP(bool enable);
     virtual int adjustRegisters();
 
+    /**
+     * @brief Hook to close additional devices beyond primary device
+     *
+     * Called after primary device closed in closeStream().
+     * Default: no-op (single-device cameras)
+     * Override: Multi-device cameras (e.g., 80363 closes Mono Path)
+     *
+     * @return APC_OK on success, error code otherwise
+     */
+    virtual int closeAdditionalDevices() { return APC_OK; }
+
+    /**
+     * @brief Hook to enable blocking mode for all devices
+     *
+     * Called in initStream() after devices opened.
+     * Default: enables for primary device only
+     * Override: Multi-device cameras enable for all endpoints
+     */
+    virtual void enableBlockingForAllDevices();
+
     // IMU
     IMUDevice::IMUDeviceInfo getIMUDeviceInfo();
     //virtual int ConfigIMU(){ return APC_OK; }
@@ -300,7 +503,8 @@ public:
 
     int getModuleID();
     int setModuleID(uint8_t nID);
-    
+    void CopyFromG1toG2();
+    void copy_file_to_g2(int fileIndex);
     int toString(char *buffer, int bufferLength);
 
     std::vector<APC_STREAM_INFO> getColorStreamInfo() { return mColorStreamInfo; }
@@ -309,6 +513,7 @@ public:
     FocalLength GetFocalLength() { return m_FocalLength; }
 	void UpdateFocalLength();
     uint16_t nZNear_default;
+    virtual int initIRProperty();
 
 protected:
     explicit CameraDevice(DEVSELINFO *devSelInfo, DEVINFORMATION *deviceInfo, const COLOR_BYTE_ORDER colorByteOrder = COLOR_BYTE_ORDER::COLOR_RGB24);
@@ -319,16 +524,41 @@ protected:
     virtual int32_t getZDTableDataType();
     virtual int32_t getZDTableSize();
     virtual int getZDTableIndex();
-    
+
+    /**
+     * @brief Convert depth raw data type to APCImageType format
+     *
+     * Default implementation delegates to SDK's APCImageType::DepthDataTypeToDepthImageType.
+     * Derived classes can override for chip-specific formats (e.g., eSP936).
+     *
+     * @param depthFormat Raw depth format value from DEPTH_RAW_DATA_TYPE
+     * @return APCImageType::Value representing depth bit depth
+     */
+    virtual APCImageType::Value getDepthImageType(uint32_t depthFormat) const;
+
+    /**
+     * @brief Get depth data type for point cloud processing
+     *
+     * Converts device-specific depth format to SDK-compatible depth data type.
+     *
+     * Default: Returns mDepthFormat directly (most chips use SDK depth types)
+     * eSP936 (80363): Maps eSP936-specific formats (0x18-0x1b) to SDK equivalents
+     *   - 0x18/0x1a (11-bit formats) -> APC_DEPTH_DATA_11_BITS
+     *   - 0x19/0x1b (14-bit formats) -> APC_DEPTH_DATA_14_BITS
+     *
+     * @return SDK-compatible depth data type for point cloud APIs
+     */
+    virtual uint32_t getPointCloudDepthType() const;
+
     virtual void updateColorPalette();
     
-    virtual int configurePointCloudInfo();
+    virtual int configurePointCloudInfo(bool isUseCached);
     virtual int enableBlockingRead(bool blocking);
-    
+    void initPostProcessOptions();
     virtual int initDepthFilterOptions();
     virtual int initDepthAccuracyOptions();
     virtual int initDepthROIOptions();
-    virtual int initIRProperty();
+    
     virtual int initRegisterReadWriteOptions();
     virtual void adjustDepthInvalidBandPixel();
 
@@ -361,8 +591,11 @@ protected:
     CameraDeviceProperties mCameraDeviceProperties;
     IRProperty mIRProperty;
     const COLOR_BYTE_ORDER mColorByteOrder;
+    PostProcessOptions mPostProcessOptions;
 
 public:
+    PostProcessOptions &getPostProcessOptions();
+    void setPostProcessOptions(PostProcessOptions &postProcessOptions);
     RegisterReadWriteOptions mRegisterReadWriteOptions;
     RegisterReadWriteController mRegisterReadWriteController;
     
@@ -435,13 +668,10 @@ public:
     friend class libeYs3D::video::DepthFrameProducer;
     friend class libeYs3D::video::PCFrameProducer;
 
-    friend class MemoryAllocator<uint8_t>;
-    friend class MemoryAllocator<uint32_t>;
-    friend class MemoryAllocator<float>;
-    friend void* MemoryAllocator__allocate(CameraDevice *cameraDevice, size_t size);
-    friend void MemoryAllocator__deallocate(CameraDevice *cameraDevice, void *p, size_t size);
-    friend size_t MemoryAllocator__max_size(CameraDevice *cameraDevice);
-    
+
+    friend APCImageType::Value libeYs3D::video::depth_raw_type_to_depth_image_type(
+                                                              uint32_t depth_raw_type,
+                                                              const libeYs3D::devices::CameraDevice* cameraDevice);
     friend int libeYs3D::video::color_image_produce_bgr_frame(const CameraDevice *cameraDevice,
                                                               libeYs3D::video::Frame *frame);
     friend int libeYs3D::video::depth_image_produce_rgb_frame(const CameraDevice *cameraDevice,
@@ -462,21 +692,9 @@ public:
     base::MessageChannel<libeYs3D::video::Frame, kMaxFrames> mDFreeQueue;
 #endif
 
-#ifdef DEVICE_MEMORY_ALLOCATOR
-protected:
-    // memory allocation
-    std::map<void *, size_t>mMemories;
-    
-    void *requestMemory(size_t size);
-    void returnMemory(const void *memory, size_t size);
-    int preallocateMemory();
-    void releasePreallocatedMemory();
-
-	MemoryAllocator<uint16_t> mPixelWordMemoryAllocator;
-    MemoryAllocator<uint8_t> mPixelByteMemoryAllocator;
-    MemoryAllocator<float> mPixelFloatMemoryAllocator;
-    
-#endif
+private:
+    std::mutex mPclInfoLck;
+    int getRectifyMatLogDataTwice();
 };
 
 class CameraDeviceFactory    {

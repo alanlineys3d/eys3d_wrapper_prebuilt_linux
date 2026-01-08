@@ -12,8 +12,10 @@
 
 #include "video/FrameProducer.h"
 #include "devices/CameraDevice.h"
-
-using libeYs3D::devices::CameraDevice;
+#include "coders.h"
+#include "PostProcessOptions.h"
+#include "IImageProcess.h"
+#include "factory.h"
 
 namespace libeYs3D    {
 namespace video    {
@@ -44,6 +46,9 @@ protected:
 
     virtual int getRawFormatBytesPerPixel(uint32_t format) override;
     virtual int readFrame(Frame *frame) override;
+    virtual int performPostProcessFilter(Frame *frame) override;
+    int getFilteredWidth() override;
+    int getFilteredHeight() override;
     virtual int produceRGBFrame(Frame *frame) override;
     virtual int performFiltering(Frame *frame) override;
     virtual int performInterleave(Frame *frame) override;
@@ -65,12 +70,13 @@ protected:
     
 private:
     libeYs3D::base::Lock mLock;
-    libeYs3D::base::Lock mmLock;
     std::vector<uint16_t> mTableZ14ToD11;
     std::vector<uint16_t> mZ14ToD11;
     
     std::list<std::vector<int16_t>> mDepthList; // for calculateDepthTemporalNoise
-    
+    std::unique_ptr<AbstractPostProcessFactory> mPostProcessFactory;
+    std::unique_ptr<IImageProcess> mPostProcessHandle;
+    PostProcessHandleCallback mPostProcessCameraParamsUpdateCallback;
     libeYs3D::base::ThreadPool<DACalculateWorkItem> mDACalculateThreadPool;
     libeYs3D::base::MessageChannel<int, 3> mFinishSignalForAccuracy;
     libeYs3D::base::MessageChannel<int, 1> mFinishSignalForROI;

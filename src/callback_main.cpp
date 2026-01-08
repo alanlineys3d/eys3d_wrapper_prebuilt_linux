@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2021 eYs3D Corporation
+ * Copyright (C) 2022 eYs3D Corporation
  * All rights reserved.
  * This project is licensed under the Apache License, Version 2.0.
  */
@@ -181,6 +181,21 @@ static bool pc_frame_callback(const libeYs3D::video::PCFrame *pcFrame)    {
 #endif
 
 #if 0
+    std::vector<CloudPoint> cloud;
+    for (int i = 0; i < pcFrame->rgbDataVec.size(); i+=3) {
+        if (pcFrame->xyzDataVec[i+2] >= 0) {
+            CloudPoint point = {
+                    pcFrame->xyzDataVec[i],pcFrame->xyzDataVec[i+1], pcFrame->xyzDataVec[i+2],
+                    pcFrame->rgbDataVec[i], pcFrame->rgbDataVec[i+1], pcFrame->rgbDataVec[i+2]
+            };
+            cloud.push_back(point);
+        }
+    }
+    std::string file = std::to_string(pcFrame->serialNumber);
+    file.append(".ply");
+    PlyWriter::writePly(cloud, file);
+#endif
+#if 0
     if((count++ % DURATION) == 0)    {
         if(count != 1)    {
             int64_t temp = 0ll;
@@ -209,7 +224,7 @@ static bool imu_data_callback(const libeYs3D::sensors::SensorData *sensorData)  
         LOG_INFO(LOG_TAG, "[# IMU #] imu_data_callback: S/N=%" PRIu32 "", sensorData->serialNumber);
 #endif
 #if 0
-    sensorData->toString(buffer, sizeof(buffer));
+    sensorData->toStringFull(buffer, sizeof(buffer));
     LOG_INFO(LOG_TAG, "%s", buffer);
 #endif
 
@@ -270,14 +285,14 @@ int TransformDepthDataType(int depth_raw_data_type , int bRectifyMode , unsigned
     //##############only happen in device 8036, need to handle when Height = 360#####################
     if (depth_raw_data_type == libeYs3D::video::DEPTH_RAW_DATA_TYPE::DEPTH_RAW_DATA_11_BITS)
     {
-		if((wPID == 0x0120 || wPID == 0x0137) && depthWidth == 640 && depthHeight == 360)
+		if((wPID == 0x0120 || wPID == 0x0137 || wPID == 0x0173) && depthWidth == 640 && (depthHeight == 360 || depthHeight == 460))
         {
 			depth_raw_data_type = libeYs3D::video::DEPTH_RAW_DATA_TYPE::DEPTH_RAW_DATA_SCALE_DOWN_11_BITS;
         }
     }
     else if (depth_raw_data_type == libeYs3D::video::DEPTH_RAW_DATA_TYPE::DEPTH_RAW_DATA_14_BITS)
     {
-        if((wPID == 0x0120 || wPID == 0x0137) && depthWidth == 640 && depthHeight == 360)
+        if((wPID == 0x0120 || wPID == 0x0137 || wPID == 0x0173) && depthWidth == 640 && (depthHeight == 360 || depthHeight == 460))
         {
             depth_raw_data_type = libeYs3D::video::DEPTH_RAW_DATA_TYPE::DEPTH_RAW_DATA_SCALE_DOWN_14_BITS;
         }
@@ -507,6 +522,40 @@ printf("========================Filter result: %d========================\n",mIs
                                  pc_frame_callback,
                                  imu_data_callback);
 #endif
+#if 0   // 8073 sample interleave L' + D
+        // device->enableInterleaveMode(true); // Un-comment this to enable Interleave Mode.
+
+        device->enableExtendIR(true);
+        auto irProp = device->getIRProperty();
+        irProp.setIRValue(96);
+        device->setIRProperty(irProp);
+        // [Test PostProcessOptions]
+        /* Spatial Filter Only Support D11 */
+        PostProcessOptions& processOptions = device->getPostProcessOptions();
+        processOptions.enableDepthDecimation(true);
+        processOptions.setDecimationFactor(2);
+
+        processOptions.enablePostProcess(true);
+        processOptions.setSpatialOutlierThreshold(3);
+        processOptions.setSpatialFilterKernelSize(7); // Should be odd number
+
+        processOptions.setColorResizeFactor(0.5f);
+        processOptions.enableColorPostProcess(true);
+        device->setPostProcessOptions(processOptions);
+
+        ret = device->initStream(libeYs3D::video::COLOR_RAW_DATA_TYPE::COLOR_RAW_DATA_YUY2,
+                                 1104, 848, 30,
+                                 libeYs3D::video::DEPTH_RAW_DATA_TYPE::DEPTH_RAW_DATA_11_BITS,
+                                 1104, 848,
+                                 DEPTH_IMG_COLORFUL_TRANSFER,
+                                 IMAGE_SN_SYNC,
+                                 1, // rectifyLogIndex
+                                 color_image_callback,
+                                 depth_image_callback,
+                                 nullptr,
+                                 nullptr);
+#endif
+
 #if 0   // 8036 scale down test
         ret = device->initStream(libeYs3D::video::COLOR_RAW_DATA_TYPE::COLOR_RAW_DATA_YUY2,
                                  1280, 720, 30,
@@ -521,6 +570,37 @@ printf("========================Filter result: %d========================\n",mIs
                                  pc_frame_callback,
                                  nullptr);
 #endif
+
+#if 0   // Hypatia2
+        ret = device->initStream(libeYs3D::video::COLOR_RAW_DATA_TYPE::COLOR_RAW_DATA_MJPG,
+                                 1280, 920, 7,
+                                 libeYs3D::video::DEPTH_RAW_DATA_TYPE::DEPTH_RAW_DATA_11_BITS,
+                                 1280, 920,
+//                                 DEPTH_IMG_NON_TRANSFER,
+                                 DEPTH_IMG_COLORFUL_TRANSFER,
+                                 IMAGE_SN_SYNC,
+                                 0, // rectifyLogIndex
+                                 color_image_callback,
+                                 depth_image_callback,
+                                 pc_frame_callback,
+                                 nullptr);
+#endif
+
+#if 0   // Hypatia2 scale down test
+        ret = device->initStream(libeYs3D::video::COLOR_RAW_DATA_TYPE::COLOR_RAW_DATA_MJPG,
+                                 1280, 920, 30,
+                                 libeYs3D::video::DEPTH_RAW_DATA_TYPE::DEPTH_RAW_DATA_SCALE_DOWN_11_BITS,
+                                 640, 460,
+//                                 DEPTH_IMG_NON_TRANSFER,
+                                 DEPTH_IMG_COLORFUL_TRANSFER,
+                                 IMAGE_SN_SYNC,
+                                 0, // rectifyLogIndex
+                                 color_image_callback,
+                                 depth_image_callback,
+                                 pc_frame_callback,
+                                 nullptr);
+#endif
+
 #if 0 // 8059 USB2 (Mode 9)
         ret = device->initStream(libeYs3D::video::COLOR_RAW_DATA_TYPE::COLOR_RAW_DATA_MJPG,
                                  1280, 720, 24,
@@ -596,6 +676,22 @@ printf("========================Filter result: %d========================\n",mIs
         if(ret != 0)    break;
                          
         device->enableStream();
+
+#if 0   // [Test PostProcessOptions] randomly enable disable on streaming
+        sleep(10);
+        for (int i = 0; i < 5000; ++i) {
+            short random = rand() % 4;
+            bool decimationOpen = random & 0x1;
+            bool postProcessOpen = random & 0x2;
+            fprintf(stderr, "Random test D:%d P:%d\n", decimationOpen, postProcessOpen);
+            processOptions.enableDepthDecimation(decimationOpen);
+            processOptions.enablePostProcess(postProcessOpen);
+            device->setPostProcessOptions(processOptions);
+            sleep(1);
+        }
+
+#endif
+
 
 #if 0
         { // Stream enablement testing
@@ -716,7 +812,7 @@ printf("========================Filter result: %d========================\n",mIs
 		}
 #endif
 
-        sleep(8);
+        sleep(800);
 
         LOG_INFO(LOG_TAG, "\n\nClosing device stream...\n");
         device->closeStream();

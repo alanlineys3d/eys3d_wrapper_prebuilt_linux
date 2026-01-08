@@ -7,8 +7,8 @@
 #define EYS3D_DEPTH_VERSION_TWEAK 1
 
 #define WRAPPER_VERSION "1.0.0.1"
-#define GIT_BRANCH "sinet_dev_release_shared_object"
-#define GIT_HASH "1e853f19"
-#define BUILD_TIMESTAMP "2022-07-04 13:09:13"
+#define GIT_BRANCH ""
+#define GIT_HASH "0e80f01"
+#define BUILD_TIMESTAMP "2026-01-08 04:57:44"
 
 #endif // VERSION_UTILS_H_IN
